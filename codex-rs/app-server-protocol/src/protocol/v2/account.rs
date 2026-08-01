@@ -1,6 +1,7 @@
+use crate::JsonSchema;
+use crate::TS;
 use crate::protocol::common::AuthMode;
 use codex_experimental_api_macros::ExperimentalApi;
-use codex_protocol::account::AmazonBedrockCredentialSource;
 use codex_protocol::account::PlanType;
 use codex_protocol::account::ProviderAccount;
 use codex_protocol::protocol::CreditsSnapshot as CoreCreditsSnapshot;
@@ -8,11 +9,9 @@ use codex_protocol::protocol::RateLimitReachedType as CoreRateLimitReachedType;
 use codex_protocol::protocol::RateLimitSnapshot as CoreRateLimitSnapshot;
 use codex_protocol::protocol::RateLimitWindow as CoreRateLimitWindow;
 use codex_protocol::protocol::SpendControlLimitSnapshot as CoreSpendControlLimitSnapshot;
-use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
-use ts_rs::TS;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -26,7 +25,10 @@ pub enum Account {
     #[serde(rename = "chatgpt", rename_all = "camelCase")]
     #[ts(rename = "chatgpt", rename_all = "camelCase")]
     Chatgpt {
-        #[schemars(required, schema_with = "nullable_string_schema")]
+        #[schemars(
+            required,
+            schema_with = "crate::protocol::serde_helpers::nullable_string_schema"
+        )]
         email: Option<String>,
         plan_type: PlanType,
     },
@@ -34,19 +36,9 @@ pub enum Account {
     #[serde(rename = "amazonBedrock", rename_all = "camelCase")]
     #[ts(rename = "amazonBedrock", rename_all = "camelCase")]
     AmazonBedrock {
-        #[serde(default = "default_bedrock_credential_source")]
-        credential_source: AmazonBedrockCredentialSource,
+        #[serde(default)]
+        uses_codex_managed_credentials: bool,
     },
-}
-
-fn nullable_string_schema(
-    generator: &mut schemars::r#gen::SchemaGenerator,
-) -> schemars::schema::Schema {
-    generator.subschema_for::<Option<String>>()
-}
-
-fn default_bedrock_credential_source() -> AmazonBedrockCredentialSource {
-    AmazonBedrockCredentialSource::AwsManaged
 }
 
 impl From<ProviderAccount> for Account {
@@ -54,9 +46,11 @@ impl From<ProviderAccount> for Account {
         match account {
             ProviderAccount::ApiKey => Self::ApiKey {},
             ProviderAccount::Chatgpt { email, plan_type } => Self::Chatgpt { email, plan_type },
-            ProviderAccount::AmazonBedrock { credential_source } => {
-                Self::AmazonBedrock { credential_source }
-            }
+            ProviderAccount::AmazonBedrock {
+                uses_codex_managed_credentials,
+            } => Self::AmazonBedrock {
+                uses_codex_managed_credentials,
+            },
         }
     }
 }
@@ -105,6 +99,11 @@ pub enum LoginAccountParams {
         #[ts(optional = nullable)]
         chatgpt_plan_type: Option<String>,
     },
+    /// [UNSTABLE] Managed Amazon Bedrock login is experimental.
+    #[experimental("account/login/start.amazonBedrock")]
+    #[serde(rename = "amazonBedrock", rename_all = "camelCase")]
+    #[ts(rename = "amazonBedrock", rename_all = "camelCase")]
+    AmazonBedrock { api_key: String, region: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
@@ -148,6 +147,9 @@ pub enum LoginAccountResponse {
     #[serde(rename = "chatgptAuthTokens", rename_all = "camelCase")]
     #[ts(rename = "chatgptAuthTokens", rename_all = "camelCase")]
     ChatgptAuthTokens {},
+    #[serde(rename = "amazonBedrock", rename_all = "camelCase")]
+    #[ts(rename = "amazonBedrock", rename_all = "camelCase")]
+    AmazonBedrock {},
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -524,6 +526,8 @@ pub struct RateLimitSnapshot {
     pub secondary: Option<RateLimitWindow>,
     pub credits: Option<CreditsSnapshot>,
     pub individual_limit: Option<SpendControlLimitSnapshot>,
+    /// Backend-reported spend-control state. `None` is unavailable, not a sparse-update recovery.
+    pub spend_control_reached: Option<bool>,
     pub plan_type: Option<PlanType>,
     pub rate_limit_reached_type: Option<RateLimitReachedType>,
 }
@@ -537,6 +541,7 @@ impl From<CoreRateLimitSnapshot> for RateLimitSnapshot {
             secondary: value.secondary.map(RateLimitWindow::from),
             credits: value.credits.map(CreditsSnapshot::from),
             individual_limit: value.individual_limit.map(SpendControlLimitSnapshot::from),
+            spend_control_reached: value.spend_control_reached,
             plan_type: value.plan_type,
             rate_limit_reached_type: value
                 .rate_limit_reached_type

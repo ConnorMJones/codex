@@ -8,12 +8,15 @@ use super::NetworkPolicyAmendment;
 use super::RequestPermissionProfile;
 use super::UserInput;
 use super::shared::v2_enum_from_core;
+use crate::JsonSchema;
+use crate::TS;
 use crate::protocol::item_builders::command_actions_for_path_uri;
 use crate::protocol::item_builders::convert_patch_changes;
 use crate::protocol::item_builders::review_output_text;
 use codex_experimental_api_macros::ExperimentalApi;
 use codex_extension_items::ExtensionItem;
 pub use codex_extension_items::image_generation::ImageGenerationItem;
+pub use codex_extension_items::sleep::SleepItem;
 pub use codex_extension_items::web_search::WebSearchAction;
 pub use codex_extension_items::web_search::WebSearchItem;
 use codex_protocol::approvals::GuardianAssessmentAction as CoreGuardianAssessmentAction;
@@ -43,7 +46,6 @@ use codex_protocol::protocol::SubAgentActivityKind as CoreSubAgentActivityKind;
 use codex_shell_command::parse_command::shlex_join;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::LegacyAppPathString;
-use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -51,7 +53,6 @@ use serde_with::serde_as;
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
-use ts_rs::TS;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -93,7 +94,7 @@ impl From<CoreReviewDecision> for CommandExecutionApprovalDecision {
                 network_policy_amendment: network_policy_amendment.into(),
             },
             CoreReviewDecision::Abort => Self::Cancel,
-            CoreReviewDecision::Denied => Self::Decline,
+            CoreReviewDecision::Denied { .. } => Self::Decline,
             CoreReviewDecision::TimedOut => Self::Decline,
         }
     }
@@ -121,7 +122,7 @@ pub enum CommandAction {
     Read {
         command: String,
         name: String,
-        path: AbsolutePathBuf,
+        path: LegacyAppPathString,
     },
     ListFiles {
         command: String,
@@ -185,7 +186,7 @@ impl CommandAction {
             } => CoreParsedCommand::Read {
                 cmd,
                 name,
-                path: path.into_path_buf(),
+                path: PathBuf::from(path.into_string()),
             },
             CommandAction::ListFiles { command: cmd, path } => {
                 CoreParsedCommand::ListFiles { cmd, path }
@@ -204,7 +205,7 @@ impl CommandAction {
             CoreParsedCommand::Read { cmd, name, path } => CommandAction::Read {
                 command: cmd,
                 name,
-                path: cwd.join(path),
+                path: cwd.join(path).into(),
             },
             CoreParsedCommand::ListFiles { cmd, path } => {
                 CommandAction::ListFiles { command: cmd, path }
@@ -268,6 +269,12 @@ pub enum ThreadItem {
     #[ts(rename_all = "camelCase")]
     CommandExecution {
         id: String,
+        /// Trusted first-party plugin id when this command resolves to one plugin script.
+        #[serde(default)]
+        plugin_id: Option<String>,
+        /// Safe plugin-relative path when this command resolves to one plugin script.
+        #[serde(default)]
+        script_path: Option<String>,
         /// The command to be executed.
         command: String,
         /// The command's working directory.
@@ -310,6 +317,7 @@ pub enum ThreadItem {
         /// Deprecated: use `appContext.resourceUri` instead.
         mcp_app_resource_uri: Option<String>,
         plugin_id: Option<String>,
+        read_only_hint: Option<bool>,
         result: Option<Box<McpToolCallResult>>,
         error: Option<McpToolCallError>,
         /// The duration of the MCP tool call in milliseconds.
@@ -368,13 +376,7 @@ pub enum ThreadItem {
         id: String,
         path: LegacyAppPathString,
     },
-    #[serde(rename_all = "camelCase")]
-    #[ts(rename_all = "camelCase")]
-    Sleep {
-        id: String,
-        #[ts(type = "number")]
-        duration_ms: u64,
-    },
+    Sleep(SleepItem),
     ImageGeneration(ImageGenerationItem),
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
@@ -403,7 +405,6 @@ pub struct McpToolCallAppContext {
     pub link_id: Option<String>,
     pub resource_uri: Option<String>,
     pub app_name: Option<String>,
-    pub template_id: Option<String>,
     pub action_name: Option<String>,
 }
 
@@ -430,11 +431,11 @@ impl ThreadItem {
             | ThreadItem::CollabAgentToolCall { id, .. }
             | ThreadItem::SubAgentActivity { id, .. }
             | ThreadItem::ImageView { id, .. }
-            | ThreadItem::Sleep { id, .. }
             | ThreadItem::EnteredReviewMode { id, .. }
             | ThreadItem::ExitedReviewMode { id, .. }
             | ThreadItem::ContextCompaction { id, .. } => id,
             ThreadItem::WebSearch(item) => &item.id,
+            ThreadItem::Sleep(item) => &item.id,
             ThreadItem::ImageGeneration(item) => &item.id,
         }
     }
@@ -842,6 +843,8 @@ impl From<CoreTurnItem> for ThreadItem {
             },
             CoreTurnItem::CommandExecution(command) => ThreadItem::CommandExecution {
                 id: command.id,
+                plugin_id: command.plugin_id,
+                script_path: command.script_path,
                 command: shlex_join(&command.command),
                 cwd: command.cwd.clone().into(),
                 process_id: command.process_id,
@@ -902,17 +905,15 @@ impl From<CoreTurnItem> for ThreadItem {
                 id: search.id,
                 query: search.query,
                 action: Some(web_search_action_from_core(search.action)),
+                results: search.results,
             }),
             CoreTurnItem::ImageView(image) => ThreadItem::ImageView {
                 id: image.id,
                 path: image.path.into(),
             },
-            CoreTurnItem::Sleep(sleep) => ThreadItem::Sleep {
-                id: sleep.id,
-                duration_ms: sleep.duration_ms,
-            },
             CoreTurnItem::Extension(extension) => match extension {
                 ExtensionItem::ImageGeneration(item) => ThreadItem::ImageGeneration(item),
+                ExtensionItem::Sleep(item) => ThreadItem::Sleep(item),
                 ExtensionItem::WebSearch(item) => ThreadItem::WebSearch(item),
             },
             CoreTurnItem::ImageGeneration(image) => {
@@ -957,11 +958,11 @@ impl From<CoreTurnItem> for ThreadItem {
                         link_id: mcp.link_id,
                         resource_uri: mcp.mcp_app_resource_uri.clone(),
                         app_name: mcp.app_name,
-                        template_id: mcp.template_id,
                         action_name: mcp.action_name,
                     }),
                     mcp_app_resource_uri: mcp.mcp_app_resource_uri,
                     plugin_id: mcp.plugin_id,
+                    read_only_hint: mcp.read_only_hint,
                     result: mcp.result.map(McpToolCallResult::from).map(Box::new),
                     error: mcp.error.map(McpToolCallError::from),
                     duration_ms,
@@ -1561,6 +1562,8 @@ pub enum DynamicToolCallOutputContentItem {
     InputText { text: String },
     #[serde(rename_all = "camelCase")]
     InputImage { image_url: String },
+    #[serde(rename_all = "camelCase")]
+    InputAudio { audio_url: String },
 }
 
 impl From<codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem>
@@ -1574,6 +1577,9 @@ impl From<codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem>
             codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem::InputImage {
                 image_url,
             } => Self::InputImage { image_url },
+            codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem::InputAudio {
+                audio_url,
+            } => Self::InputAudio { audio_url },
         }
     }
 }
@@ -1586,6 +1592,9 @@ impl From<DynamicToolCallOutputContentItem>
             DynamicToolCallOutputContentItem::InputText { text } => Self::InputText { text },
             DynamicToolCallOutputContentItem::InputImage { image_url } => {
                 Self::InputImage { image_url }
+            }
+            DynamicToolCallOutputContentItem::InputAudio { audio_url } => {
+                Self::InputAudio { audio_url }
             }
         }
     }
@@ -1615,7 +1624,7 @@ pub struct ToolRequestUserInputQuestion {
     pub options: Option<Vec<ToolRequestUserInputOption>>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[derive(Serialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 /// EXPERIMENTAL. Params sent with a request_user_input event.
@@ -1624,9 +1633,39 @@ pub struct ToolRequestUserInputParams {
     pub turn_id: String,
     pub item_id: String,
     pub questions: Vec<ToolRequestUserInputQuestion>,
+    pub is_blocking: bool,
+    /// @deprecated Use `isBlocking` to decide whether the request should block.
     #[serde(default)]
     #[ts(type = "number | null")]
     pub auto_resolution_ms: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for ToolRequestUserInputParams {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct WireToolRequestUserInputParams {
+            thread_id: String,
+            turn_id: String,
+            item_id: String,
+            questions: Vec<ToolRequestUserInputQuestion>,
+            is_blocking: Option<bool>,
+            auto_resolution_ms: Option<u64>,
+        }
+
+        let wire = WireToolRequestUserInputParams::deserialize(deserializer)?;
+        Ok(Self {
+            thread_id: wire.thread_id,
+            turn_id: wire.turn_id,
+            item_id: wire.item_id,
+            questions: wire.questions,
+            is_blocking: wire.is_blocking.unwrap_or(true),
+            auto_resolution_ms: wire.auto_resolution_ms,
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

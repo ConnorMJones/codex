@@ -1,24 +1,36 @@
-use codex_core_skills::SKILLS_HOW_TO_USE_WITH_ABSOLUTE_PATHS;
-use codex_core_skills::render_available_skills_body;
 use codex_extension_api::ContextualUserFragment;
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_CLOSE_TAG;
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
 
+use crate::catalog_prompt::SKILLS_HOW_TO_USE_WITH_ABSOLUTE_PATHS;
+use crate::catalog_prompt::SKILLS_HOW_TO_USE_WITH_ALIASES;
+use crate::catalog_prompt::render_available_skills_body;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AvailableSkillsInstructions {
+    skill_root_lines: Vec<String>,
     skill_lines: Vec<String>,
 }
 
 impl AvailableSkillsInstructions {
     pub(crate) fn from_skill_lines(
+        skill_root_lines: Vec<String>,
         mut skill_lines: Vec<String>,
         include_skills_usage_instructions: bool,
     ) -> Self {
         if include_skills_usage_instructions {
             skill_lines.push("### How to use skills".to_string());
-            skill_lines.push(SKILLS_HOW_TO_USE_WITH_ABSOLUTE_PATHS.to_string());
+            let instructions = if skill_root_lines.is_empty() {
+                SKILLS_HOW_TO_USE_WITH_ABSOLUTE_PATHS
+            } else {
+                SKILLS_HOW_TO_USE_WITH_ALIASES
+            };
+            skill_lines.push(instructions.to_string());
         }
-        Self { skill_lines }
+        Self {
+            skill_root_lines,
+            skill_lines,
+        }
     }
 }
 
@@ -36,7 +48,7 @@ impl ContextualUserFragment for AvailableSkillsInstructions {
     }
 
     fn body(&self) -> String {
-        render_available_skills_body(&[], &self.skill_lines)
+        render_available_skills_body(&self.skill_root_lines, &self.skill_lines)
     }
 }
 
@@ -45,6 +57,14 @@ pub(crate) struct SkillInstructions {
     pub(crate) name: String,
     pub(crate) path: String,
     pub(crate) contents: String,
+    pub(crate) executor_resource_access: Option<ExecutorSkillResourceAccess>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExecutorSkillResourceAccess {
+    pub(crate) authority_id: String,
+    pub(crate) package: String,
+    pub(crate) main_resource: String,
 }
 
 impl ContextualUserFragment for SkillInstructions {
@@ -64,6 +84,21 @@ impl ContextualUserFragment for SkillInstructions {
         let name = &self.name;
         let path = &self.path;
         let contents = &self.contents;
-        format!("\n<name>{name}</name>\n<path>{path}</path>\n{contents}\n")
+        let resource_access = self
+            .executor_resource_access
+            .as_ref()
+            .map(|access| {
+                let metadata = serde_json::json!({
+                    "authority": {
+                        "kind": "executor",
+                        "id": access.authority_id,
+                    },
+                    "package": access.package,
+                    "main_resource": access.main_resource,
+                });
+                format!("\n<resource_access>{metadata}</resource_access>")
+            })
+            .unwrap_or_default();
+        format!("\n<name>{name}</name>\n<path>{path}</path>{resource_access}\n{contents}\n")
     }
 }

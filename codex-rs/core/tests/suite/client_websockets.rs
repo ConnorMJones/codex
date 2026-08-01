@@ -7,6 +7,7 @@ use codex_core::ModelClientSession;
 use codex_core::Prompt;
 use codex_core::ResponseEvent;
 use codex_core::X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER;
+use codex_core::test_support::with_parent_turn;
 use codex_features::Feature;
 use codex_http_client::OutboundProxyPolicy;
 use codex_login::CodexAuth;
@@ -18,6 +19,7 @@ use codex_otel::MetricsConfig;
 use codex_otel::SessionTelemetry;
 use codex_otel::TelemetryAuthMode;
 use codex_otel::current_span_w3c_trace_context;
+use codex_protocol::ResponseItemId;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::account::PlanType;
@@ -160,8 +162,7 @@ async fn responses_websocket_streams_request() {
 
     let harness = websocket_harness(&server).await;
     let mut client_session = harness.client.new_session();
-    let mut prompt = prompt_with_input(vec![message_item("hello")]);
-    prompt.input[0].set_id(Some("msg_existing".to_string()));
+    let prompt = prompt_with_input(vec![message_item("hello")]);
 
     stream_until_complete(&mut client_session, &harness, &prompt).await;
 
@@ -173,7 +174,6 @@ async fn responses_websocket_streams_request() {
     assert_eq!(body["model"].as_str(), Some(MODEL));
     assert_eq!(body["stream"], serde_json::Value::Bool(true));
     assert_eq!(body["input"].as_array().map(Vec::len), Some(1));
-    assert_eq!(body["input"][0].get("id"), None);
     let handshake = server.single_handshake();
     assert_eq!(
         handshake.header(OPENAI_BETA_HEADER),
@@ -206,6 +206,59 @@ async fn responses_websocket_streams_request() {
         .parse::<i64>()
         .expect("websocket stream request start timestamp should be an integer");
     assert!(stream_request_start_ms > 0);
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_websocket_omits_unprefixed_item_ids_without_mutating_prompt() {
+    skip_if_no_network!();
+
+    let server = start_websocket_server(vec![vec![vec![
+        ev_response_created("resp-1"),
+        ev_completed("resp-1"),
+    ]]])
+    .await;
+
+    let harness = websocket_harness_with_provider_options(
+        websocket_provider(&server),
+        /*runtime_metrics_enabled*/ false,
+        /*concurrent_reasoning_summaries_enabled*/ false,
+        /*enabled_features*/ &[],
+    )
+    .await;
+    let mut client_session = harness.client.new_session();
+    let mut prefixed = message_item("prefixed");
+    prefixed.set_id(Some(ResponseItemId::with_suffix("msg", "existing")));
+    let unprefixed = serde_json::from_value(json!({
+        "type": "message",
+        "id": "018f9e15-7a6a-7000-8000-000000000001",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "legacy message"}],
+    }))
+    .expect("legacy response item should deserialize");
+    let empty = serde_json::from_value(json!({
+        "type": "message",
+        "id": "",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "empty-id message"}],
+    }))
+    .expect("response item with an empty id should deserialize");
+    let prompt = prompt_with_input(vec![prefixed, unprefixed, empty]);
+
+    stream_until_complete(&mut client_session, &harness, &prompt).await;
+
+    let connection = server.single_connection();
+    let body = connection.first().expect("missing request").body_json();
+    assert_eq!(body["input"].as_array().map(Vec::len), Some(3));
+    assert_eq!(body["input"][0]["id"].as_str(), Some("msg_existing"));
+    assert_eq!(body["input"][1].get("id"), None);
+    assert_eq!(body["input"][2].get("id"), None);
+    assert_eq!(
+        serde_json::to_value(&prompt.input).expect("prompt input should serialize")[1]["id"]
+            .as_str(),
+        Some("018f9e15-7a6a-7000-8000-000000000001")
+    );
 
     server.shutdown().await;
 }
@@ -681,8 +734,7 @@ async fn responses_websocket_sends_responses_lite_metadata_per_request() {
     .await;
 
     let harness = websocket_harness(&server).await;
-    let mut normal_model_info = harness.model_info.clone();
-    normal_model_info.supports_reasoning_summaries = true;
+    let normal_model_info = harness.model_info.clone();
     let mut lite_model_info = normal_model_info.clone();
     lite_model_info.use_responses_lite = true;
     let mut session = harness.client.new_session();
@@ -970,7 +1022,7 @@ async fn responses_websocket_v2_requests_use_v2_when_provider_supports_websocket
     let server = start_websocket_server(vec![vec![
         vec![
             ev_response_created("resp-1"),
-            ev_assistant_message("msg-1", "assistant output"),
+            ev_assistant_message("msg_1", "assistant output"),
             ev_completed("resp-1"),
         ],
         vec![ev_response_created("resp-2"), ev_completed("resp-2")],
@@ -982,7 +1034,7 @@ async fn responses_websocket_v2_requests_use_v2_when_provider_supports_websocket
     let prompt_one = prompt_with_input(vec![message_item("hello")]);
     let prompt_two = prompt_with_input(vec![
         message_item("hello"),
-        assistant_message_item("msg-1", "assistant output"),
+        assistant_message_item("1", "assistant output"),
         message_item("second"),
     ]);
 
@@ -1016,11 +1068,11 @@ async fn responses_websocket_v2_requests_use_v2_when_provider_supports_websocket
 async fn responses_websocket_v2_incremental_requests_are_reused_across_turns() {
     skip_if_no_network!();
 
-    let mut assistant_output_with_turn_id = ev_assistant_message("msg-1", "assistant output");
+    let mut assistant_output_with_turn_id = ev_assistant_message("msg_1", "assistant output");
     assistant_output_with_turn_id["item"]["internal_chat_message_metadata_passthrough"] =
         json!({ "turn_id": "turn-1" });
 
-    let assistant_output_without_turn_id = ev_assistant_message("msg-2", "second assistant output");
+    let assistant_output_without_turn_id = ev_assistant_message("msg_2", "second assistant output");
 
     let server = start_websocket_server(vec![vec![
         vec![
@@ -1056,7 +1108,7 @@ async fn responses_websocket_v2_incremental_requests_are_reused_across_turns() {
     }
 
     // Turn two: the response and reconstructed history have matching metadata.
-    let mut first_assistant_output = assistant_message_item("msg-1", "assistant output");
+    let mut first_assistant_output = assistant_message_item("1", "assistant output");
     first_assistant_output.set_turn_id_if_missing("turn-1");
 
     let prompt_two = prompt_with_input(vec![
@@ -1071,7 +1123,7 @@ async fn responses_websocket_v2_incremental_requests_are_reused_across_turns() {
     }
 
     // Turn three: the reconstructed history has metadata that the response omitted.
-    let mut second_assistant_output = assistant_message_item("msg-2", "second assistant output");
+    let mut second_assistant_output = assistant_message_item("2", "second assistant output");
     second_assistant_output.set_turn_id_if_missing("turn-2");
 
     let prompt_three = prompt_with_input(vec![
@@ -1119,7 +1171,7 @@ async fn responses_websocket_v2_wins_when_both_features_enabled() {
     let server = start_websocket_server(vec![vec![
         vec![
             ev_response_created("resp-1"),
-            ev_assistant_message("msg-1", "assistant output"),
+            ev_assistant_message("msg_1", "assistant output"),
             ev_completed("resp-1"),
         ],
         vec![ev_response_created("resp-2"), ev_completed("resp-2")],
@@ -1131,7 +1183,7 @@ async fn responses_websocket_v2_wins_when_both_features_enabled() {
     let prompt_one = prompt_with_input(vec![message_item("hello")]);
     let prompt_two = prompt_with_input(vec![
         message_item("hello"),
-        assistant_message_item("msg-1", "assistant output"),
+        assistant_message_item("1", "assistant output"),
         message_item("second"),
     ]);
 
@@ -1237,8 +1289,8 @@ async fn responses_websocket_includes_timing_metrics_header_when_runtime_metrics
     assert_eq!(summary.responses_api_inference_time_ms, 450);
     assert_eq!(summary.responses_api_engine_iapi_ttft_ms, 310);
     assert_eq!(summary.responses_api_engine_service_ttft_ms, 340);
-    assert_eq!(summary.responses_api_engine_iapi_tbt_ms, 220);
-    assert_eq!(summary.responses_api_engine_service_tbt_ms, 260);
+    assert_eq!(summary.responses_api_engine_iapi_tbt_ms, 220.0);
+    assert_eq!(summary.responses_api_engine_service_tbt_ms, 260.0);
 
     server.shutdown().await;
 }
@@ -1430,7 +1482,11 @@ async fn responses_websocket_usage_limit_error_emits_rate_limit_event() {
             "x-codex-secondary-used-percent": "87.5",
             "x-codex-primary-over-secondary-limit-percent": "95.0",
             "x-codex-primary-window-minutes": "15",
-            "x-codex-secondary-window-minutes": "60"
+            "x-codex-secondary-window-minutes": "60",
+            "x-codex-credits-has-credits": "true",
+            "x-codex-credits-unlimited": "false",
+            "x-codex-credits-balance": "",
+            "x-codex-rate-limit-reached-type": "workspace_member_usage_limit_reached"
         }
     });
 
@@ -1490,10 +1546,15 @@ async fn responses_websocket_usage_limit_error_emits_rate_limit_event() {
                     "window_minutes": 60,
                     "resets_at": null
                 },
-                "credits": null,
+                "credits": {
+                    "has_credits": true,
+                    "unlimited": false,
+                    "balance": null
+                },
                 "individual_limit": null,
+                "spend_control_reached": null,
                 "plan_type": null,
-                "rate_limit_reached_type": null
+                "rate_limit_reached_type": "workspace_member_usage_limit_reached"
             }
         })
     );
@@ -1503,7 +1564,7 @@ async fn responses_websocket_usage_limit_error_emits_rate_limit_event() {
         unreachable!();
     };
     assert!(
-        error_event.message.to_lowercase().contains("usage limit"),
+        error_event.message.contains("spend cap set by the owner"),
         "unexpected error message for submission {submission_id}: {}",
         error_event.message
     );
@@ -1629,7 +1690,7 @@ async fn responses_websocket_uses_incremental_create_on_prefix() {
     let server = start_websocket_server(vec![vec![
         vec![
             ev_response_created("resp-1"),
-            ev_assistant_message("msg-1", "assistant output"),
+            ev_assistant_message("msg_1", "assistant output"),
             ev_completed("resp-1"),
         ],
         vec![ev_response_created("resp-2"), ev_completed("resp-2")],
@@ -1641,7 +1702,7 @@ async fn responses_websocket_uses_incremental_create_on_prefix() {
     let prompt_one = prompt_with_input(vec![message_item("hello")]);
     let prompt_two = prompt_with_input(vec![
         message_item("hello"),
-        assistant_message_item("msg-1", "assistant output"),
+        assistant_message_item("1", "assistant output"),
         message_item("second"),
     ]);
 
@@ -1671,7 +1732,7 @@ async fn responses_websocket_uses_incremental_create_on_prefix() {
 async fn responses_websocket_forwards_turn_metadata_on_initial_and_incremental_create() {
     skip_if_no_network!();
 
-    let mut first_output_item = ev_assistant_message("msg-1", "assistant output");
+    let mut first_output_item = ev_assistant_message("msg_1", "assistant output");
     first_output_item["item"]["internal_chat_message_metadata_passthrough"] =
         json!({"turn_id": "turn-123"});
     let server = start_websocket_server(vec![vec![
@@ -1687,15 +1748,17 @@ async fn responses_websocket_forwards_turn_metadata_on_initial_and_incremental_c
     let harness = websocket_harness(&server).await;
     let mut client_session = harness.client.new_session();
     let prompt_one = prompt_with_input(vec![message_item("hello")]);
-    let mut prior_assistant_output = assistant_message_item("msg-1", "assistant output");
+    let mut prior_assistant_output = assistant_message_item("1", "assistant output");
     prior_assistant_output.set_turn_id_if_missing("turn-123");
     let prompt_two = prompt_with_input(vec![
         message_item("hello"),
         prior_assistant_output,
         message_item("second"),
     ]);
-    let first_responses_metadata = turn_metadata(&harness, Some("turn-123"));
-    let second_responses_metadata = turn_metadata(&harness, Some("turn-456"));
+    let first_responses_metadata =
+        with_parent_turn(turn_metadata(&harness, Some("turn-123")), "parent-turn-123");
+    let second_responses_metadata =
+        with_parent_turn(turn_metadata(&harness, Some("turn-456")), "parent-turn-456");
 
     stream_until_complete_with_metadata(
         &mut client_session,
@@ -1737,6 +1800,10 @@ async fn responses_websocket_forwards_turn_metadata_on_initial_and_incremental_c
 
     assert_eq!(first_metadata["turn_id"].as_str(), Some("turn-123"));
     assert_eq!(second_metadata["turn_id"].as_str(), Some("turn-456"));
+    core_test_support::responses::assert_parent_turn(&first, Some("parent-turn-123"))
+        .expect("initial WebSocket parent-turn metadata");
+    core_test_support::responses::assert_parent_turn(&second, Some("parent-turn-456"))
+        .expect("incremental WebSocket parent-turn metadata");
     assert_eq!(
         first["client_metadata"]["turn_id"].as_str(),
         first_metadata["turn_id"].as_str()
@@ -1802,7 +1869,7 @@ async fn responses_websocket_uses_previous_response_id_when_prefix_after_complet
     let server = start_websocket_server(vec![vec![
         vec![
             ev_response_created("resp-1"),
-            ev_assistant_message("msg-1", "assistant output"),
+            ev_assistant_message("msg_1", "assistant output"),
             ev_completed("resp-1"),
         ],
         vec![ev_response_created("resp-2"), ev_completed("resp-2")],
@@ -1814,7 +1881,7 @@ async fn responses_websocket_uses_previous_response_id_when_prefix_after_complet
     let prompt_one = prompt_with_input(vec![message_item("hello")]);
     let prompt_two = prompt_with_input(vec![
         message_item("hello"),
-        assistant_message_item("msg-1", "assistant output"),
+        assistant_message_item("1", "assistant output"),
         message_item("second"),
     ]);
 
@@ -1911,7 +1978,7 @@ async fn responses_websocket_v2_creates_with_previous_response_id_on_prefix() {
     let server = start_websocket_server(vec![vec![
         vec![
             ev_response_created("resp-1"),
-            ev_assistant_message("msg-1", "assistant output"),
+            ev_assistant_message("msg_1", "assistant output"),
             ev_completed("resp-1"),
         ],
         vec![ev_response_created("resp-2"), ev_completed("resp-2")],
@@ -1923,7 +1990,7 @@ async fn responses_websocket_v2_creates_with_previous_response_id_on_prefix() {
     let prompt_one = prompt_with_input(vec![message_item("hello")]);
     let prompt_two = prompt_with_input(vec![
         message_item("hello"),
-        assistant_message_item("msg-1", "assistant output"),
+        assistant_message_item("1", "assistant output"),
         message_item("second"),
     ]);
 
@@ -2177,7 +2244,7 @@ fn message_item(text: &str) -> ResponseItem {
 
 fn assistant_message_item(id: &str, text: &str) -> ResponseItem {
     ResponseItem::Message {
-        id: Some(id.to_string()),
+        id: Some(ResponseItemId::with_suffix("msg", id)),
         role: "assistant".into(),
         content: vec![ContentItem::OutputText { text: text.into() }],
         phase: None,
@@ -2225,6 +2292,7 @@ fn websocket_provider_with_connect_timeout(
         websocket_connect_timeout_ms,
         requires_openai_auth: false,
         supports_websockets: true,
+        supports_standalone_web_search: false,
     }
 }
 
@@ -2327,7 +2395,6 @@ async fn websocket_harness_with_provider_options(
         /*enable_request_compression*/ false,
         runtime_metrics_enabled,
         /*beta_features_header*/ None,
-        /*item_ids_enabled*/ config.features.enabled(Feature::ItemIds),
         /*concurrent_reasoning_summaries_enabled*/
         config
             .features

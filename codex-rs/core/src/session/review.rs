@@ -112,6 +112,7 @@ pub(super) async fn spawn_review_thread(
         sub_id: review_turn_id.clone(),
         trace_id: current_span_trace_id(),
         realtime_active: parent_turn_context.realtime_active,
+        code_mode_available: parent_turn_context.code_mode_available,
         config: per_turn_config,
         auth_manager: auth_manager_for_context,
         model_info: model_info.clone(),
@@ -130,7 +131,10 @@ pub(super) async fn spawn_review_thread(
         timezone: parent_turn_context.timezone.clone(),
         app_server_client_name: parent_turn_context.app_server_client_name.clone(),
         developer_instructions: None,
-        collaboration_mode: parent_turn_context.collaboration_mode.clone(),
+        mode: parent_turn_context.mode,
+        collaboration_mode_developer_instructions: parent_turn_context
+            .collaboration_mode_developer_instructions
+            .clone(),
         multi_agent_version: MultiAgentVersion::Disabled,
         personality: parent_turn_context.personality,
         approval_policy: parent_turn_context.approval_policy.clone(),
