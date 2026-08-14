@@ -18,6 +18,7 @@ use codex_cli::run_login_with_api_key;
 use codex_cli::run_login_with_chatgpt;
 use codex_cli::run_login_with_device_code;
 use codex_cli::run_logout;
+use codex_cloud_config::cloud_config_bundle_loader_for_storage;
 use codex_cloud_tasks::Cli as CloudTasksCli;
 use codex_exec::Cli as ExecCli;
 use codex_exec::Command as ExecCommand;
@@ -45,12 +46,14 @@ use supports_color::Stream;
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod app_cmd;
+mod cloud_config;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod desktop_app;
 mod doctor;
 mod exec_server_telemetry;
 mod marketplace_cmd;
 mod mcp_cmd;
+mod migrate_rollouts;
 mod plugin_cmd;
 mod remote_control_cmd;
 #[cfg(target_os = "windows")]
@@ -70,9 +73,12 @@ use codex_config::LoaderOverrides;
 use codex_core::build_models_manager;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
+use codex_core::config::ConfigLoadOptions;
 use codex_core::config::ConfigOverrides;
+use codex_core::config::bootstrap_auth_config;
 use codex_core::config::edit::ConfigEditsBuilder;
 use codex_core::config::find_codex_home;
+use codex_core::config::load_config_toml_with_layer_stack;
 use codex_core::config::resolve_profile_v2_config_path;
 use codex_features::FEATURES;
 use codex_features::Stage;
@@ -80,6 +86,7 @@ use codex_features::is_known_feature_key;
 use codex_home::CodexHomeUserInstructionsProvider;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
+use codex_login::is_workload_identity_selected;
 use codex_login::read_codex_access_token_from_env;
 use codex_memories_write::clear_memory_roots_contents;
 use codex_models_manager::bundled_models_response;
@@ -185,6 +192,9 @@ enum Subcommand {
 
     /// Permanently delete a saved session by id or session name.
     Delete(DeleteCommand),
+
+    /// Inspect or migrate legacy local sessions to paginated thread history.
+    MigrateRollouts(migrate_rollouts::MigrateRolloutsCommand),
 
     /// Unarchive a saved session by id or session name.
     Unarchive(SessionArchiveCommand),
@@ -568,6 +578,14 @@ struct ExecServerCommand {
     /// Error out when config.toml contains fields that are not recognized by this version of Codex.
     #[arg(long = "strict-config", default_value_t = false)]
     strict_config: bool,
+
+    /// Maximum number of requests to process concurrently on each connection.
+    #[arg(
+        long = "concurrent-requests",
+        value_name = "COUNT",
+        default_value = "1"
+    )]
+    request_dispatch_mode: codex_exec_server::RequestDispatchMode,
 
     /// Transport endpoint URL. Supported values: `ws://IP:PORT` (default), `stdio`, `stdio://`.
     #[arg(long = "listen", value_name = "URL", conflicts_with = "remote")]
@@ -983,7 +1001,6 @@ async fn cli_main(
         mut interactive,
         subcommand,
     } = MultitoolCli::parse();
-
     // Fold --enable/--disable into config overrides so they flow to all subcommands.
     let toggle_overrides = feature_toggles.to_overrides()?;
     root_config_overrides.raw_overrides.extend(toggle_overrides);
@@ -1321,6 +1338,14 @@ async fn cli_main(
             .await?;
             println!("{output}");
         }
+        Some(Subcommand::MigrateRollouts(command)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "migrate-rollouts",
+            )?;
+            migrate_rollouts::run(command, root_config_overrides).await?;
+        }
         Some(Subcommand::Unarchive(cmd)) => {
             let output = run_session_archive_cli_command(
                 codex_tui::SessionArchiveAction::Unarchive,
@@ -1621,22 +1646,16 @@ async fn cli_main(
                     root_remote_auth_token_env.as_deref(),
                     "features list",
                 )?;
-                let mut cli_kv_overrides = root_config_overrides
-                    .parse_overrides()
-                    .map_err(anyhow::Error::msg)?;
-
                 // Honor `--search` via the canonical web_search mode.
                 if interactive.web_search {
-                    cli_kv_overrides.push((
-                        "web_search".to_string(),
-                        toml::Value::String("live".to_string()),
-                    ));
+                    root_config_overrides
+                        .raw_overrides
+                        .push("web_search=\"live\"".to_string());
                 }
 
-                let config = ConfigBuilder::default()
-                    .cli_overrides(cli_kv_overrides)
-                    .build()
-                    .await?;
+                let config =
+                    cloud_config::load_config(&root_config_overrides, LoaderOverrides::default())
+                        .await?;
                 let mut rows = Vec::with_capacity(FEATURES.len());
                 let mut name_width = 0;
                 let mut stage_width = 0;
@@ -1721,7 +1740,12 @@ async fn run_exec_server_command(
         let environment_id = cmd
             .environment_id
             .ok_or_else(|| anyhow::anyhow!("--environment-id is required when --remote is set"))?;
-        let config = load_exec_server_config(root_config_overrides, strict_config).await?;
+        let config = load_exec_server_config(
+            root_config_overrides,
+            strict_config,
+            /*enable_workload_identity*/ true,
+        )
+        .await?;
         let (_otel, telemetry) = exec_server_telemetry::init(Some(&config));
         let auth_provider =
             load_exec_server_remote_auth_provider(&config, &base_url, cmd.use_agent_identity_auth)
@@ -1735,6 +1759,7 @@ async fn run_exec_server_command(
         if let Some(name) = cmd.name {
             remote_config.name = name;
         }
+        remote_config.request_dispatch_mode = cmd.request_dispatch_mode;
         let remote_config = remote_config.with_telemetry(telemetry);
         let parent_lifetime = if cmd.exit_on_stdin_close {
             exec_server_telemetry::ParentLifetime::StdinPipe
@@ -1759,7 +1784,12 @@ async fn run_exec_server_command(
         .await?;
         Ok(())
     } else {
-        let config_result = load_exec_server_config(root_config_overrides, strict_config).await;
+        let config_result = load_exec_server_config(
+            root_config_overrides,
+            strict_config,
+            /*enable_workload_identity*/ false,
+        )
+        .await;
         let config = if strict_config {
             Some(config_result?)
         } else {
@@ -1784,6 +1814,7 @@ async fn run_exec_server_command(
                     runtime_paths,
                     telemetry,
                     http_client_factory,
+                    cmd.request_dispatch_mode,
                 )
                 .await
             },
@@ -1801,20 +1832,23 @@ async fn load_exec_server_remote_auth_provider(
     use_agent_identity_auth: bool,
 ) -> anyhow::Result<codex_api::SharedAuthProvider> {
     if use_agent_identity_auth {
-        let agent_identity_jwt = read_codex_access_token_from_env().ok_or_else(|| {
+        read_codex_access_token_from_env().ok_or_else(|| {
             anyhow::anyhow!("CODEX_ACCESS_TOKEN is required when --use-agent-identity-auth is set")
         })?;
-        let auth_route_config = config.auth_route_config();
-        let auth = CodexAuth::from_agent_identity_jwt(
-            &agent_identity_jwt,
-            Some(&config.chatgpt_base_url),
-            &auth_route_config,
-        )
-        .await?;
+        let auth = AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false)
+            .await?
+            .auth()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Agent Identity authentication is unavailable"))?;
+        if !matches!(auth, CodexAuth::AgentIdentity(_)) {
+            anyhow::bail!(
+                "CODEX_ACCESS_TOKEN did not provide permitted Agent Identity authentication"
+            );
+        }
         return Ok(codex_model_provider::auth_provider_from_auth(&auth));
     }
 
-    let auth = load_exec_server_remote_auth(
+    let (auth_manager, auth) = load_exec_server_remote_auth(
         config,
         "remote exec-server registration requires ChatGPT authentication or API key authentication; run `codex login` or set CODEX_API_KEY",
     )
@@ -1830,7 +1864,14 @@ async fn load_exec_server_remote_auth_provider(
         validate_api_key_remote_host(base_url)?;
     }
 
-    Ok(codex_model_provider::auth_provider_from_auth(&auth))
+    if auth_manager.is_workload_identity_selected() {
+        Ok(codex_model_provider::auth_provider_from_auth_manager(
+            auth_manager,
+            &auth,
+        ))
+    } else {
+        Ok(codex_model_provider::auth_provider_from_auth(&auth))
+    }
 }
 
 fn is_supported_exec_server_remote_auth(auth: &CodexAuth) -> bool {
@@ -1874,23 +1915,46 @@ fn validate_api_key_remote_host(base_url: &str) -> anyhow::Result<()> {
 async fn load_exec_server_config(
     root_config_overrides: &CliConfigOverrides,
     strict_config: bool,
+    enable_workload_identity: bool,
 ) -> anyhow::Result<codex_core::config::Config> {
     let cli_kv_overrides = root_config_overrides
         .parse_overrides()
         .map_err(anyhow::Error::msg)?;
-    Ok(ConfigBuilder::default()
+    let bootstrap_cli_overrides = cli_kv_overrides.clone();
+    let mut builder = ConfigBuilder::default()
         .cli_overrides(cli_kv_overrides)
-        .strict_config(strict_config)
-        .build()
-        .await?)
+        .strict_config(strict_config);
+    if enable_workload_identity && is_workload_identity_selected() {
+        let codex_home = find_codex_home()?;
+        let bootstrap_cwd = AbsolutePathBuf::current_dir()?;
+        let bootstrap_config = load_config_toml_with_layer_stack(
+            &codex_home,
+            Some(&bootstrap_cwd),
+            bootstrap_cli_overrides,
+            ConfigLoadOptions {
+                loader_overrides: LoaderOverrides::default(),
+                strict_config,
+                cloud_config_bundle: Default::default(),
+            },
+        )
+        .await?;
+        let bootstrap_auth_config = bootstrap_auth_config(&codex_home, &bootstrap_config)?;
+        let cloud_config_bundle = cloud_config_bundle_loader_for_storage(
+            bootstrap_auth_config,
+            /*enable_codex_api_key_env*/ false,
+        )
+        .await?;
+        builder = builder.cloud_config_bundle(cloud_config_bundle);
+    }
+    Ok(builder.build().await?)
 }
 
 async fn load_exec_server_remote_auth(
     config: &codex_core::config::Config,
     missing_auth_error: &'static str,
-) -> anyhow::Result<codex_login::CodexAuth> {
+) -> anyhow::Result<(Arc<AuthManager>, codex_login::CodexAuth)> {
     let auth_manager =
-        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ true).await;
+        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ true).await?;
 
     let auth = match auth_manager.auth().await {
         Some(auth) => auth,
@@ -1903,7 +1967,7 @@ async fn load_exec_server_remote_auth(
         }
     };
 
-    Ok(auth)
+    Ok((auth_manager, auth))
 }
 
 async fn enable_feature_in_config(feature: &str) -> anyhow::Result<()> {
@@ -2052,7 +2116,7 @@ async fn run_debug_prompt_input_command(
         config.codex_home.clone(),
     ));
     let auth_manager =
-        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
+        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await?;
     let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
     codex_git_attribution::install(
         &mut extensions,
@@ -2098,7 +2162,7 @@ async fn run_debug_models_command(
             .build()
             .await?;
         let auth_manager =
-            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ true).await;
+            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ true).await?;
         let models_manager = build_models_manager(&config, auth_manager);
         models_manager
             .raw_model_catalog(
@@ -2222,6 +2286,7 @@ fn unsupported_subcommand_name_for_strict_config(
         Some(Subcommand::RemoteControl(remote_control)) => Some(remote_control.subcommand_name()),
         Some(Subcommand::Mcp(_)) => Some("mcp"),
         Some(Subcommand::Plugin(_)) => Some("plugin"),
+        Some(Subcommand::MigrateRollouts(_)) => Some("migrate-rollouts"),
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         Some(Subcommand::App(_)) => Some("app"),
         Some(Subcommand::Login(_)) => Some("login"),
@@ -4046,17 +4111,44 @@ mod tests {
     }
 
     #[test]
+    fn app_server_grpc_code_mode_host_url_parses_independently_of_listen_transport() {
+        let app_server = app_server_from_args(
+            [
+                "codex",
+                "app-server",
+                "--code-mode-host",
+                "https://example.test",
+                "--listen",
+                "ws://127.0.0.1:4500",
+            ]
+            .as_ref(),
+        );
+
+        assert_eq!(
+            app_server.code_mode_host.code_mode_host,
+            Some(url::Url::parse("https://example.test").expect("test endpoint should parse"))
+        );
+    }
+
+    #[test]
     fn app_server_rejects_invalid_code_mode_host_urls() {
         for endpoint in [
-            "http://127.0.0.1:8765",
+            "ftp://127.0.0.1:8765",
             "ws://",
             "wss://example.test/code-mode#fragment",
+            "https://example.test/code-mode",
+            "http://alice:secret@example.test",
+            "https://alice:secret@example.test",
+            "http://example.test/?token=secret",
         ] {
             let error =
                 MultitoolCli::try_parse_from(["codex", "app-server", "--code-mode-host", endpoint])
                     .expect_err("invalid code-mode host endpoint should fail argument parsing");
 
             assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+            let rendered_error = error.to_string();
+            assert!(!rendered_error.contains("alice"));
+            assert!(!rendered_error.contains("secret"));
         }
     }
 
